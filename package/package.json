@@ -1,0 +1,26 @@
+{
+  "name": "dsh-job-ats",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "求职 ATS 工作台 for the DSH web GUI: workspace-persisted job-hunt state (.ats/*) plus browser view tabs (筛选工作/工作分析/ATS 优化/简历库/投递追踪/模拟面试), gated to sessions on the job-ats preset.",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

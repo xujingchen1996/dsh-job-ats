@@ -1,9 +1,9 @@
 // dsh-job-ats browser bundle.
 //
 // Hand-written classic-script bundle in the ClientModuleLoader envelope:
-// registers six view tabs in the `conversation.view` slot (筛选工作 / 工作分析
-// / ATS 优化 / 简历库 / 投递追踪 / 模拟面试) and reads/writes the workspace
-// `.ats/*` job-hunt state through the host half's `/ats-api/*` routes.
+// registers seven view tabs in the `conversation.view` slot (职位搜索 / 筛选工作
+// / 工作分析 / ATS 优化 / 简历库 / 投递追踪 / 模拟面试) and reads/writes the
+// workspace `.ats/*` job-hunt state through the host half's `/ats-api/*` routes.
 window.__ModuleLoader__.load({
   id: "dsh-job-ats",
   factory: (require) => {
@@ -2001,6 +2001,232 @@ function sessionPreset(row) {
       )
     }
 
+    // ── 职位搜索 ────────────────────────────────────────────────────────────
+
+    const SEARCH_SOURCES_UI = [
+      { id: "boss", label: "Boss直聘" },
+      { id: "shixiseng", label: "实习僧" },
+      { id: "offershow", label: "OfferShow" },
+      { id: "web", label: "全网" },
+    ]
+
+    function fmtClock(ts) {
+      if (!ts) return "—"
+      const d = new Date(ts)
+      return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+    }
+
+    function useSearchStore(sessionId) {
+      const [data, setData] = React.useState(null)
+      const [error, setError] = React.useState(null)
+      const refresh = React.useCallback(async () => {
+        if (!sessionId) return
+        try {
+          const json = await apiGet(sessionId, "/search")
+          if (json && json.ok) { setData(json); setError(null) }
+          else setError((json && json.error) || "加载失败")
+        } catch (err) {
+          setError(String((err && err.message) || err))
+        }
+      }, [sessionId])
+      React.useEffect(() => {
+        if (sessionId) refresh()
+      }, [sessionId, refresh])
+      return { data, error, refresh }
+    }
+
+    function SearchPanel({ store, sessionId }) {
+      const { toast, flash } = useToast()
+      const search = useSearchStore(sessionId)
+      const cfg = (search.data && search.data.config) || {}
+      const results = (search.data && search.data.results) || []
+      const [keywords, setKeywords] = React.useState("")
+      const [city, setCity] = React.useState("")
+      const [sources, setSources] = React.useState(SEARCH_SOURCES_UI.map((s) => s.id))
+      const [formSeeded, setFormSeeded] = React.useState(false)
+      const [showSchedule, setShowSchedule] = React.useState(false)
+      const [intervalMinutes, setIntervalMinutes] = React.useState(30)
+      const [running, setRunning] = React.useState(false)
+      const [selectedId, setSelectedId] = React.useState(null)
+      const [jd, setJd] = React.useState(null) // null=未加载;{loading}|{text}|{error,url}
+
+      React.useEffect(() => {
+        if (search.data && !formSeeded) {
+          setFormSeeded(true)
+          if (cfg.keywords) setKeywords(cfg.keywords)
+          if (cfg.city) setCity(cfg.city)
+          if (Array.isArray(cfg.sources) && cfg.sources.length > 0) setSources(cfg.sources)
+          if (cfg.intervalMinutes) setIntervalMinutes(cfg.intervalMinutes)
+        }
+      }, [search.data, formSeeded])
+
+      const selected = results.find((r) => r.id === selectedId) || null
+      const scheduleOn = cfg.scheduleEnabled === true
+
+      async function runSearch() {
+        if (!keywords.trim()) { flash("先填写搜索关键词(岗位 / 技能)", "error"); return }
+        setRunning(true)
+        try {
+          const json = await apiPost(sessionId, "/search/run", { keywords, city, sources })
+          if (json && json.ok) {
+            flash(`搜索完成:新增 ${json.added} 条(共 ${json.total} 条)`)
+            await search.refresh()
+          } else flash((json && json.error) || "搜索失败", "error")
+        } catch (err) {
+          flash(String((err && err.message) || err), "error")
+        } finally {
+          setRunning(false)
+        }
+      }
+
+      async function saveSchedule(enabled) {
+        const json = await apiPost(sessionId, "/search/schedule", { enabled, intervalMinutes, keywords, city, sources })
+        if (json && json.ok) {
+          flash(enabled ? `定时刷新已开启:每 ${json.config.intervalMinutes} 分钟自动搜索一次` : "定时刷新已关闭")
+          await search.refresh()
+        } else flash((json && json.error) || "保存失败", "error")
+      }
+
+      async function loadJd(item) {
+        setJd({ loading: true })
+        const json = await apiPost(sessionId, "/search/jd", { id: item.id })
+        if (json && json.ok) setJd({ text: json.jd })
+        else setJd({ error: (json && json.error) || "抓取失败", url: (json && json.url) || item.url })
+      }
+
+      async function applyOne(item) {
+        const json = await apiPost(sessionId, "/search/apply", { id: item.id })
+        if (json && json.ok) {
+          try { await navigator.clipboard.writeText(json.greeting) } catch {}
+          window.open(json.url, "_blank", "noopener")
+          flash("打招呼语已复制、岗位页已打开:粘贴发送即完成投递;已同步写入投递追踪 ✓")
+          await search.refresh()
+          store.refresh()
+        } else flash((json && json.error) || "代投失败", "error")
+      }
+
+      async function collectOne(item) {
+        const json = await apiPost(sessionId, "/jobs", {
+          action: "add",
+          item: {
+            title: item.title,
+            company: item.company,
+            link: item.url,
+            type: /实习/.test(`${item.title} ${item.snippet || ""}`) ? "实习" : "社招",
+            location: item.city || "",
+            salary: item.salary || "",
+            source: `搜索·${item.sourceLabel}`,
+            snippet: item.snippet || "",
+          },
+        })
+        if (json && json.ok) { flash("已收录到岗位库,去「筛选工作」查看 ✓"); store.refresh() }
+        else flash((json && json.error) || "收录失败", "error")
+      }
+
+      function toggleSource(id) {
+        setSources((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]))
+      }
+
+      return h(Panel, {
+        title: "职位搜索",
+        hint: "聚合 Boss直聘 / 实习僧 / OfferShow 与全网公开岗位索引(经搜索引擎 site: 限定;详情页有登录墙时以摘要与链接为准)。一键代投为半自动:复制打招呼语并打开岗位页,粘贴发送即完成投递,同时写入投递追踪。",
+        actions: [
+          h("button", { key: "sched", className: "ats-btn" + (scheduleOn ? " ats-btn-primary" : ""), onClick: () => setShowSchedule((v) => !v) },
+            scheduleOn ? `⏱ 定时中·每 ${cfg.intervalMinutes} 分钟` : "⏱ 定时刷新"),
+          h("button", { key: "run", className: "ats-btn ats-btn-primary", disabled: running, onClick: runSearch },
+            running ? "搜索中…" : "🔍 搜索"),
+        ],
+      },
+        h("div", { className: "ats-search-formrow" },
+          h("input", { className: "ats-input", style: { flex: 2, minWidth: 180 }, placeholder: "岗位 / 技能关键词,如:Java 后端、产品实习", value: keywords, onChange: (e) => setKeywords(e.target.value), onKeyDown: (e) => { if (e.key === "Enter") runSearch() } }),
+          h("input", { className: "ats-input", style: { flex: 1, minWidth: 100 }, placeholder: "城市(可空)", value: city, onChange: (e) => setCity(e.target.value), onKeyDown: (e) => { if (e.key === "Enter") runSearch() } }),
+        ),
+        h("div", null,
+          SEARCH_SOURCES_UI.map((s) =>
+            h("button", {
+              key: s.id,
+              className: "ats-chip" + (sources.includes(s.id) ? " ats-chip-active" : ""),
+              onClick: () => toggleSource(s.id),
+            }, s.label),
+          ),
+        ),
+        showSchedule && h("div", { className: "ats-export-bar", style: { marginTop: 12 } },
+          h("span", { className: "ats-checkbox" },
+            h("input", { type: "checkbox", checked: scheduleOn, onChange: (e) => saveSchedule(e.target.checked) }),
+            "启用定时刷新",
+          ),
+          h("select", { className: "ats-input", style: { width: 150 }, value: intervalMinutes, onChange: (e) => setIntervalMinutes(Number(e.target.value)) },
+            [15, 30, 60, 120, 240].map((m) => h("option", { key: m, value: m }, `每 ${m} 分钟`)),
+          ),
+          h("button", { className: "ats-btn ats-btn-primary", onClick: () => saveSchedule(true) }, "保存并开启"),
+          scheduleOn && h("button", { className: "ats-btn ats-btn-danger", onClick: () => saveSchedule(false) }, "关闭定时"),
+          h("span", { className: "ats-dim" },
+            `上次刷新 ${fmtClock(cfg.lastRunAt)}` + (scheduleOn && cfg.nextRunAt ? ` · 下次 ${fmtClock(cfg.nextRunAt)}` : "")),
+        ),
+        h("div", { className: "ats-dim", style: { margin: "10px 0 12px" } },
+          `共 ${results.length} 条` +
+          (results.some((r) => r.applied) ? ` · 已代投 ${results.filter((r) => r.applied).length} 条` : "") +
+          (scheduleOn ? " · 定时刷新运行中" : "")),
+        h("div", { className: "ats-search-grid" },
+          h("div", { className: "ats-search-side" },
+            search.error && h("div", { className: "ats-status-error" }, "加载失败:" + search.error),
+            results.length === 0
+              ? h("div", { className: "ats-empty-card" },
+                  h("h4", null, "还没有搜索结果"),
+                  h("p", null, "填写关键词与城市、选择来源后点「搜索」。开启定时刷新后,会按间隔自动搜索并去重合并。"),
+                )
+              : results.map((item) =>
+                  h("div", {
+                    key: item.id,
+                    className: "ats-search-item" + (item.id === selectedId ? " ats-search-item-active" : "") + (item.applied ? " ats-search-applied" : ""),
+                    onClick: () => { setSelectedId(item.id); setJd(null) },
+                  },
+                    h("div", { className: "ats-search-item-title" }, (item.applied ? "✅ " : "") + item.title),
+                    h("div", { className: "ats-search-item-meta" },
+                      h("span", { className: "ats-badge ats-badge-blue" }, item.sourceLabel || item.source),
+                      item.salary && h("span", { className: "ats-badge ats-badge-gold" }, item.salary),
+                      item.city && h("span", { className: "ats-badge" }, item.city),
+                      item.company && h("span", { className: "ats-dim" }, item.company),
+                    ),
+                    item.snippet && h("div", { className: "ats-search-item-snippet" }, item.snippet),
+                  ),
+                ),
+          ),
+          h("div", { className: "ats-search-main" },
+            !selected
+              ? h("div", { className: "ats-status" }, "← 从左侧选择一个岗位查看详情")
+              : h("div", null,
+                  h("div", { className: "ats-card-title", style: { fontSize: 15 } }, selected.title),
+                  h("div", { className: "ats-card-tags", style: { marginTop: 6 } },
+                    h("span", { className: "ats-badge ats-badge-blue" }, selected.sourceLabel || selected.source),
+                    selected.company && h("span", { className: "ats-badge" }, selected.company),
+                    selected.salary && h("span", { className: "ats-badge ats-badge-gold" }, selected.salary),
+                    selected.city && h("span", { className: "ats-badge" }, selected.city),
+                    selected.applied && h("span", { className: "ats-badge ats-badge-green" }, "已代投"),
+                  ),
+                  h("div", { className: "ats-card-actions", style: { marginTop: 10 } },
+                    h("button", { className: "ats-btn ats-btn-primary", onClick: () => applyOne(selected) }, "🚀 一键代投"),
+                    h("button", { className: "ats-btn", onClick: () => collectOne(selected) }, "📥 收录到岗位库"),
+                    h("button", { className: "ats-btn", onClick: () => loadJd(selected) }, jd && jd.text ? "🔄 重新抓取 JD" : "📄 抓取 JD"),
+                    h("button", { className: "ats-btn", onClick: () => { navigator.clipboard.writeText(selected.url).then(() => flash("链接已复制")) } }, "复制链接"),
+                    h("a", { className: "ats-btn", href: selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗"),
+                  ),
+                  h("div", { className: "ats-search-jd" },
+                    jd === null
+                      ? "点「抓取 JD」读取岗位描述;站点需要登录时抓取会失败,可直接打开原页查看。"
+                      : jd.loading
+                        ? "抓取中…"
+                        : jd.text
+                          ? jd.text
+                          : h("span", null, h("span", { className: "ats-status-error" }, jd.error || "抓取失败"), " ",
+                              h("a", { href: jd.url || selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗")),
+                  ),
+                ),
+          ),
+        ),
+      )
+    }
+
     // ── gate + tab definitions ──────────────────────────────────────────────
 
     function EmptyHint() {
@@ -2009,7 +2235,7 @@ function sessionPreset(row) {
         { className: "ats-root" },
         h("div", { className: "ats-empty" },
           h("h3", null, "此会话未启用「求职 ATS 模式」"),
-          h("p", null, "新建会话时在预设选择器中选择「求职 ATS 模式」，即可在这里使用筛选工作、工作分析、ATS 简历优化、简历库、投递追踪与模拟面试六个工作台。"),
+          h("p", null, "新建会话时在预设选择器中选择「求职 ATS 模式」，即可在这里使用职位搜索、筛选工作、工作分析、ATS 简历优化、简历库、投递追踪与模拟面试七个工作台。"),
         ),
       )
     }
@@ -2025,6 +2251,7 @@ function sessionPreset(row) {
     }
 
     const TABS = [
+      { id: "ats-search", order: 39, label: "职位搜索", panel: SearchPanel },
       { id: "ats-jobs", order: 40, label: "筛选工作", panel: JobsPanel },
       { id: "ats-analysis", order: 41, label: "工作分析", panel: AnalysisPanel },
       { id: "ats-ats", order: 42, label: "ATS 优化", panel: AtsPanel },
@@ -2223,6 +2450,19 @@ function sessionPreset(row) {
 .ats-edit-spacer { flex: 1; }
 .ats-edit-form { display: flex; flex-direction: column; gap: 10px; width: 100%; }
 .ats-analysis .ats-card-actions { flex-direction: column; align-items: flex-end; }
+.ats-search-grid { display: grid; grid-template-columns: minmax(320px, 5fr) 7fr; gap: 16px; align-items: start; }
+.ats-search-side { display: flex; flex-direction: column; gap: 10px; max-height: 72vh; overflow: auto; padding-right: 2px; }
+.ats-search-item { border: 1px solid rgba(128,128,128,.22); border-radius: 10px; padding: 10px 12px; cursor: pointer; background: rgba(128,128,128,.04); }
+.ats-search-item:hover { border-color: rgba(59,130,246,.5); }
+.ats-search-item-active { border-color: rgba(59,130,246,.8); background: rgba(59,130,246,.1); }
+.ats-search-applied { opacity: .62; }
+.ats-search-item-title { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ats-search-item-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; align-items: center; }
+.ats-search-item-snippet { margin-top: 5px; font-size: 12px; opacity: .65; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ats-search-main { border: 1px solid rgba(128,128,128,.22); border-radius: 10px; padding: 14px 16px; min-height: 320px; }
+.ats-search-jd { margin-top: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.6; max-height: 46vh; overflow: auto; background: rgba(128,128,128,.05); border-radius: 8px; padding: 12px; }
+.ats-search-formrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.ats-search-formrow .ats-input { width: auto; }
 `
 
     // ── plugin body ─────────────────────────────────────────────────────────

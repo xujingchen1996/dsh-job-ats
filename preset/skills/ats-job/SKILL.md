@@ -7,6 +7,7 @@
 | 文件 | 结构 | 说明 |
 | --- | --- | --- |
 | `settings.json` | `{resumeDir, theme}` | 简历目录（用户可在简历库标签页修改）、导出主题 |
+| `search.json` | `{config, results:[SearchHit]}` | 职位搜索聚合（职位搜索标签页）：搜索词/城市/来源/定时计划 + 聚合结果 |
 | `jobs.json` | `{items:[Job]}` | 岗位列表（筛选工作标签页） |
 | `analyses.json` | `{items:[Analysis]}` | 岗位分析（工作分析标签页） |
 | `resumes.json` | `{items:[ResumeEntry]}` | 简历库登记表 |
@@ -45,8 +46,16 @@
 - `ats_apply_upsert` / `ats_apply_remove` — 维护投递记录。
 - `ats_interview_request` — 读取面试请求。
 - `ats_interview_update` — 更新面试记录与小结。
+- `ats_search_run` — 执行一次职位聚合搜索（Boss直聘/实习僧/OfferShow/全网，payload `{keywords, city?, sources?}`）。
+- `ats_search_read` — 读搜索配置与最近结果（含定时刷新状态与每条结果的 id）。
+- `ats_apply_send` — 对一条搜索结果代投：`{id, greeting}`（greeting 由你结合简历与 JD 撰写，80-150 字）→ 自动收录岗位库 + 写投递追踪（已投递）+ 推送链接与打招呼语到浏览器。
 
 ## 3. 各标签页工作流
+
+### 职位搜索
+用户说「帮我找 XX 岗位」且希望聚合多个渠道时，优先用 `ats_search_run`（而不是手工 web 搜索）：它会把 Boss直聘 / 实习僧 / OfferShow / 全网的公开岗位索引聚合进「职位搜索」标签页并自动去重。用户可自己在标签页设置定时刷新（每 15-240 分钟自动搜一次）。
+
+**代投流程**：用户看中某条结果说「帮我投」时：`ats_status` / `ats_resume_read` 了解简历 → `ats_search_read` 拿到该条的 id → 撰写个性化打招呼语（结合 JD 亮点与简历最强匹配点，80-150 字，自然不浮夸）→ `ats_apply_send {id, greeting}`。插件会自动收录岗位库、写入投递追踪（已投递），并把打招呼语复制到剪贴板、打开岗位页——**用户只需粘贴发送**。注意：各平台投递均需登录态与人工确认，不存在无人值守的自动提交，不要向用户承诺「全自动投递」。
 
 ### 筛选工作
 用户说「帮我找 XX 岗位」时：用 web 搜索 → 汇总合适岗位 → `ats_jobs_upsert` 写入（带 title/company/link/type/source，snippet 放岗位要点或 JD 摘要）→ 对话里简短汇报，引导用户去标签页看。用户也可以自己在标签页添加/删除，无需你参与。

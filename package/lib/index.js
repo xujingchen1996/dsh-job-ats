@@ -24,6 +24,7 @@ import { THEMES, mdParse, buildDocx, buildHtml } from "./docx.js"
 export const inject = [
   "fs",
   "tools",
+  "web",
   "webServer",
   "sessions",
   "sessionPersistence",
@@ -269,6 +270,15 @@ function applyApiMode(ctx) {
       }),
     "dsh-job-ats: /ats-api route",
   )
+  // 定时搜索清扫器:每 60 秒检查一次已登记工作区的搜索计划,到期则自动执行。
+  // 工作区在首次设置定时或手动搜索时登记(见 scheduledSearchCwds);宿主重启后
+  // 登记为空,由下次打开「职位搜索」标签页或手动搜索恢复。
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      sweepScheduledSearches(ctx).catch(() => {})
+    }, 60_000)
+    return () => clearInterval(timer)
+  }, "dsh-job-ats: scheduled search sweep")
 }
 
 async function parseJsonBody(req) {
@@ -328,6 +338,232 @@ async function listTasks(ctx, cwd, signal) {
   }
   tasks.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
   return tasks.filter((task) => task.status !== "deleted")
+}
+
+// ── 职位搜索聚合(.ats/search.json)───────────────────────────────────────────
+//
+// 聚合方式:Boss直聘 / 实习僧 / OfferShow 没有公开 API,详情页有登录墙与反爬,
+// 直接抓取不可靠。这里经 host 的 `web` 搜索服务按 site: 限定聚合公开索引
+// (标题 / 链接 / 摘要),JD 详情按需抓取、失败则降级为打开链接。「一键代投」
+// 为半自动:写入岗位库 + 投递追踪,返回打招呼语文本(浏览器端复制)并打开岗位页
+// —— 各平台投递均需登录态与人工确认,无法也不应无人值守提交。
+
+const SEARCH_FILE = join(ATS_DIR, "search.json")
+const SEARCH_SOURCES = {
+  boss: { label: "Boss直聘", query: (kw, city) => ["site:zhipin.com", kw, city, "招聘"].filter(Boolean).join(" ") },
+  shixiseng: { label: "实习僧", query: (kw, city) => ["site:shixiseng.com", kw, city, "实习"].filter(Boolean).join(" ") },
+  offershow: { label: "OfferShow", query: (kw, city) => ["offershow", kw, city, "薪资 岗位"].filter(Boolean).join(" ") },
+  web: { label: "全网", query: (kw, city) => [kw, city, "招聘 岗位"].filter(Boolean).join(" ") },
+}
+const SEARCH_DEFAULT_SOURCES = ["boss", "shixiseng", "offershow", "web"]
+const SEARCH_MAX_RESULTS = 300
+const CITY_POOL = [
+  "北京", "上海", "广州", "深圳", "杭州", "成都", "南京", "武汉", "西安", "苏州",
+  "天津", "长沙", "重庆", "合肥", "郑州", "厦门", "福州", "济南", "青岛", "大连",
+  "宁波", "无锡", "佛山", "东莞", "沈阳", "哈尔滨", "昆明", "远程",
+]
+
+// 已登记定时搜索的工作区(cwd)。宿主重启后为空,首次设置定时/手动搜索时恢复。
+const scheduledSearchCwds = new Set()
+
+async function sweepScheduledSearches(ctx) {
+  for (const cwd of [...scheduledSearchCwds]) {
+    try {
+      const data = await readJson(ctx, cwd, SEARCH_FILE, undefined)
+      const cfg = data && data.config && typeof data.config === "object" ? data.config : null
+      if (!cfg || cfg.scheduleEnabled !== true) {
+        scheduledSearchCwds.delete(cwd)
+        continue
+      }
+      const due = typeof cfg.nextRunAt !== "number" || Date.now() >= cfg.nextRunAt
+      if (!due) continue
+      await runSearchNow(ctx, cwd, undefined, {
+        keywords: cfg.keywords,
+        city: cfg.city,
+        sources: cfg.sources,
+        by: "schedule",
+      }, undefined)
+    } catch {
+      // 单个工作区失败不影响其他;留给下次清扫重试
+    }
+  }
+}
+
+function searchResultId(url) {
+  // djb2 → base36:只做去重键,不需要密码学强度
+  let h = 5381
+  const text = String(url || "")
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0
+  return "s" + (h >>> 0).toString(36)
+}
+
+function extractSalary(text) {
+  const m = String(text || "").match(
+    /(\d+\s*[-~～]\s*\d+\s*[KkW万]|\d+\s*[KkW万]\s*[-~～]\s*\d+\s*[KkW万]|\d+\s*元\s*\/\s*天|\d+\s*万?\s*\/\s*年|\d+\s*[-~～]\s*\d+\s*元\s*\/\s*天)/,
+  )
+  return m ? m[1].replace(/\s+/g, "") : null
+}
+
+function stripHtml(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function guessCompany(title) {
+  const m = String(title || "").match(/【(.+?)】|(.+?)招聘|(.+?)直聘|(.+?)诚聘/)
+  const hit = m && (m[1] || m[2] || m[3] || m[4])
+  return typeof hit === "string" && hit.length > 1 && hit.length <= 40 ? hit.trim() : null
+}
+
+function defaultSearchConfig() {
+  return {
+    keywords: "",
+    city: "",
+    sources: SEARCH_DEFAULT_SOURCES,
+    scheduleEnabled: false,
+    intervalMinutes: 30,
+    lastRunAt: null,
+    nextRunAt: null,
+  }
+}
+
+async function readSearchData(ctx, cwd, signal) {
+  const data = await readJson(ctx, cwd, SEARCH_FILE, signal)
+  return {
+    config: data && data.config && typeof data.config === "object" ? { ...defaultSearchConfig(), ...data.config } : defaultSearchConfig(),
+    results: data && Array.isArray(data.results) ? data.results : [],
+  }
+}
+
+async function runSearchNow(ctx, cwd, session, opts, signal) {
+  const keywords = cleanText(opts.keywords, 120)
+  if (!keywords) throw new Error("缺少搜索关键词(keywords)")
+  const city = cleanText(opts.city, 40)
+  const requested = Array.isArray(opts.sources) && opts.sources.length > 0 ? opts.sources : SEARCH_DEFAULT_SOURCES
+  const useSources = requested.filter((s) => SEARCH_SOURCES[s])
+  const finalSources = useSources.length > 0 ? useSources : SEARCH_DEFAULT_SOURCES
+
+  const data = await readSearchData(ctx, cwd, signal)
+  const results = data.results
+  const seenUrls = new Set(results.map((r) => r.url))
+
+  const fresh = []
+  const perSource = {}
+  for (const sid of finalSources) {
+    const src = SEARCH_SOURCES[sid]
+    try {
+      const query = src.query(keywords, city)
+      const out = await ctx.web.search({ query, maxResults: 10 })
+      let added = 0
+      for (const s of out?.sources ?? []) {
+        if (!s.url || seenUrls.has(s.url)) continue
+        seenUrls.add(s.url)
+        const text = `${s.title || ""} ${s.snippet || ""}`
+        fresh.push({
+          id: searchResultId(s.url),
+          title: cleanText(s.title, 160) || "(无标题)",
+          company: guessCompany(s.title) || src.label,
+          url: s.url,
+          source: sid,
+          sourceLabel: src.label,
+          city: city || CITY_POOL.find((c) => text.includes(c)) || null,
+          salary: extractSalary(text),
+          snippet: cleanText(s.snippet, 300) || null,
+          publishedAt: typeof s.publishedAt === "string" ? s.publishedAt : null,
+          fetchedAt: new Date().toISOString(),
+          jd: null,
+          applied: false,
+        })
+        added++
+      }
+      perSource[sid] = { ok: true, added }
+    } catch (error) {
+      perSource[sid] = { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  const merged = [...fresh, ...results].slice(0, SEARCH_MAX_RESULTS)
+  const cfg = data.config
+  cfg.keywords = keywords
+  cfg.city = city
+  cfg.sources = finalSources
+  cfg.lastRunAt = Date.now()
+  if (opts.by === "schedule" && cfg.scheduleEnabled === true) {
+    cfg.nextRunAt = Date.now() + Math.max(5, Number(cfg.intervalMinutes) || 30) * 60_000
+  }
+  await writeJson(ctx, cwd, SEARCH_FILE, { config: cfg, results: merged }, session, signal)
+  scheduledSearchCwds.add(cwd)
+  return { added: fresh.length, total: merged.length, perSource }
+}
+
+// 一键代投的共同实现(路由与模型工具共用):收录进岗位库 → 写投递追踪 →
+// 标记结果已投 → 返回链接与打招呼语。
+async function applySearchItem(ctx, cwd, session, id, greeting, signal) {
+  const data = await readSearchData(ctx, cwd, signal)
+  const item = data.results.find((r) => String(r.id) === String(id))
+  if (item === undefined) return undefined
+
+  const jobs = await readList(ctx, cwd, join(ATS_DIR, "jobs.json"), signal)
+  let job = jobs.find((j) => cleanLink(j.link) === cleanLink(item.url))
+  if (job === undefined) {
+    const isIntern = /实习/.test(`${item.title} ${item.snippet || ""}`)
+    job = cleanJob(
+      {
+        title: item.title,
+        company: item.company,
+        link: item.url,
+        type: isIntern ? "实习" : "社招",
+        location: item.city ?? "",
+        salary: item.salary ?? "",
+        source: `搜索·${item.sourceLabel}`,
+        snippet: item.snippet ?? "",
+        status: "applied",
+      },
+      makeId("job-"),
+    )
+    if (job !== undefined) {
+      jobs.push(job)
+      await writeList(ctx, cwd, join(ATS_DIR, "jobs.json"), jobs, session, signal)
+    }
+  }
+
+  const applications = await readList(ctx, cwd, join(ATS_DIR, "applications.json"), signal)
+  const exists = applications.find((a) => cleanLink(a.link) === cleanLink(item.url))
+  if (exists === undefined) {
+    const app = cleanApplication(
+      {
+        position: item.title,
+        company: item.company,
+        link: item.url,
+        type: job?.type || "社招",
+        currentStep: "applied",
+        note: "职位搜索·一键代投",
+      },
+      makeId("app-"),
+    )
+    if (app !== undefined) {
+      applications.unshift(app)
+      await writeList(ctx, cwd, join(ATS_DIR, "applications.json"), applications, session, signal)
+    }
+  }
+
+  item.applied = true
+  await writeJson(ctx, cwd, SEARCH_FILE, data, session, signal)
+
+  const finalGreeting =
+    cleanText(greeting, 500) ||
+    `您好!看到贵司发布的「${item.title}」岗位,与我的背景很匹配,非常感兴趣,期待与您进一步沟通!`
+  return { url: item.url, greeting: finalGreeting, company: item.company, position: item.title }
 }
 
 async function handleApiRequest(ctx, req, res) {
@@ -394,6 +630,89 @@ async function handleApiRequest(ctx, req, res) {
       tasks: taskRows,
       exports: exports.filter((f) => /\.(docx|pdf|html?)$/i.test(f.name)),
     })
+    return
+  }
+
+  // ── 职位搜索聚合 ──
+  if (route === "/ats-api/search" && req.method === "GET") {
+    const data = await readSearchData(ctx, cwd, signal)
+    sendJson(res, 200, {
+      ok: true,
+      config: data.config,
+      results: data.results,
+      sources: Object.entries(SEARCH_SOURCES).map(([id, s]) => ({ id, label: s.label })),
+    })
+    return
+  }
+
+  if (route === "/ats-api/search/run" && req.method === "POST") {
+    const body = await parseJsonBody(req)
+    const out = await runSearchNow(ctx, cwd, session, {
+      keywords: body?.keywords,
+      city: body?.city,
+      sources: body?.sources,
+      by: "manual",
+    }, signal)
+    sendJson(res, 200, { ok: true, ...out })
+    return
+  }
+
+  if (route === "/ats-api/search/schedule" && req.method === "POST") {
+    const body = await parseJsonBody(req)
+    const data = await readSearchData(ctx, cwd, signal)
+    const cfg = data.config
+    cfg.scheduleEnabled = body?.enabled === true
+    cfg.intervalMinutes = Math.max(5, Math.min(720, Number(body?.intervalMinutes) || 30))
+    if (typeof body?.keywords === "string") cfg.keywords = cleanText(body.keywords, 120)
+    if (typeof body?.city === "string") cfg.city = cleanText(body.city, 40)
+    if (Array.isArray(body?.sources)) {
+      const filtered = body.sources.filter((s) => SEARCH_SOURCES[s])
+      if (filtered.length > 0) cfg.sources = filtered
+    }
+    cfg.nextRunAt = cfg.scheduleEnabled ? Date.now() + cfg.intervalMinutes * 60_000 : null
+    await writeJson(ctx, cwd, SEARCH_FILE, data, session, signal)
+    if (cfg.scheduleEnabled) scheduledSearchCwds.add(cwd)
+    else scheduledSearchCwds.delete(cwd)
+    sendJson(res, 200, { ok: true, config: cfg })
+    return
+  }
+
+  if (route === "/ats-api/search/jd" && req.method === "POST") {
+    const body = await parseJsonBody(req)
+    const data = await readSearchData(ctx, cwd, signal)
+    const item = data.results.find((r) => String(r.id) === String(body?.id))
+    if (item === undefined) {
+      sendJson(res, 404, { ok: false, error: "找不到该搜索结果" })
+      return
+    }
+    if (typeof item.jd === "string" && item.jd.length > 0) {
+      sendJson(res, 200, { ok: true, jd: item.jd, cached: true })
+      return
+    }
+    try {
+      const out = await ctx.web.fetch({ url: item.url })
+      if (out.statusCode >= 400) throw new Error(`页面返回 ${out.statusCode}(该站点可能需要登录)`)
+      const content = out.body && typeof out.body.content === "string" ? out.body.content : ""
+      const text = stripHtml(content).slice(0, 20000)
+      if (text.length < 80) throw new Error("页面内容过短,可能需要登录后才能看到 JD")
+      item.jd = text
+      await writeJson(ctx, cwd, SEARCH_FILE, data, session, signal)
+      sendJson(res, 200, { ok: true, jd: text })
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      sendJson(res, 200, { ok: false, error: `${msg};请直接打开链接查看 JD`, url: item.url })
+    }
+    return
+  }
+
+  if (route === "/ats-api/search/apply" && req.method === "POST") {
+    const body = await parseJsonBody(req)
+    const out = await applySearchItem(ctx, cwd, session, body?.id, body?.greeting, signal)
+    if (out === undefined) {
+      sendJson(res, 404, { ok: false, error: "找不到该搜索结果" })
+      return
+    }
+    sendJson(res, 200, { ok: true, ...out })
     return
   }
 
@@ -1331,6 +1650,9 @@ function applyToolsMode(ctx) {
         ctx.tools.register(atsApplyRemoveTool(ctx)),
         ctx.tools.register(atsInterviewRequestTool(ctx)),
         ctx.tools.register(atsInterviewUpdateTool(ctx)),
+        ctx.tools.register(atsSearchRunTool(ctx)),
+        ctx.tools.register(atsSearchReadTool(ctx)),
+        ctx.tools.register(atsApplySendTool(ctx)),
       ]
       return () => {
         for (const dispose of disposers) dispose()
@@ -1909,6 +2231,79 @@ function atsInterviewUpdateTool(ctx) {
         await ctx.fs.writeText(target, payload.transcript.slice(0, 200000), undefined, signal, policy)
       }
       return `已更新面试记录 ${clean.id}（${ROUND_LABELS[clean.round] || clean.round}，status=${clean.status}）。`
+    },
+  })
+}
+
+function atsSearchRunTool(ctx) {
+  return defineTool({
+    name: "ats_search_run",
+    description:
+      "执行一次职位聚合搜索(Boss直聘 / 实习僧 / OfferShow / 全网;经搜索引擎 site: 限定聚合公开岗位索引),结果写入「职位搜索」标签页并持久化到 .ats/search.json。payload 为 JSON 字符串:{keywords:\"Java 后端\", city?:\"上海\", sources?:[\"boss\",\"shixiseng\",\"offershow\",\"web\"]}。用户想找岗位、看机会、比选项时使用;搜完提醒用户去「职位搜索」标签页浏览,可对心仪岗位用 ats_apply_send 代投。",
+    parameters: {
+      payload: { type: "string", required: true, description: 'JSON 字符串:{keywords:"关键词", city:"城市(可省)", sources?:["boss","web"]}' },
+    },
+    output: TEXT_OUTPUT,
+    async execute(args, exec) {
+      const { cwd, session } = workspaceOf(exec)
+      const payload = payloadObject(args, "ats_search_run")
+      const out = await runSearchNow(ctx, cwd, session, {
+        keywords: payload.keywords,
+        city: payload.city,
+        sources: payload.sources,
+        by: "manual",
+      }, exec.signal)
+      const failed = Object.entries(out.perSource).filter(([, v]) => v.ok === false).map(([k, v]) => `${k}:${v.error}`)
+      return `搜索完成:新增 ${out.added} 条(总计 ${out.total} 条),用户可在「职位搜索」标签页查看。` +
+        (out.added === 0 ? "没有新结果,建议换关键词或扩展来源重试。" : "心仪的岗位可以用 ats_apply_send 生成个性化打招呼语并一键代投。") +
+        (failed.length > 0 ? `\n部分来源失败:${failed.join(";")}` : "")
+    },
+  })
+}
+
+function atsSearchReadTool(ctx) {
+  return defineTool({
+    name: "ats_search_read",
+    description:
+      "读取「职位搜索」的配置与聚合结果(.ats/search.json):搜索关键词、定时刷新计划、最近 40 条结果(标题/公司/来源/薪资/链接/是否已投)。用户问「搜到了什么」「定时刷新开了吗」时使用。",
+    parameters: {},
+    output: TEXT_OUTPUT,
+    async execute(_args, exec) {
+      const { cwd } = workspaceOf(exec)
+      const data = await readSearchData(ctx, cwd, exec.signal)
+      const cfg = data.config
+      return JSON.stringify({
+        搜索词: cfg.keywords,
+        城市: cfg.city,
+        来源: cfg.sources,
+        定时刷新: cfg.scheduleEnabled ? `每 ${cfg.intervalMinutes} 分钟` : "未启用",
+        上次刷新: cfg.lastRunAt ? new Date(cfg.lastRunAt).toLocaleString() : null,
+        下次自动刷新: cfg.nextRunAt ? new Date(cfg.nextRunAt).toLocaleString() : null,
+        总数: data.results.length,
+        最近结果: data.results.slice(0, 40).map((r) => ({
+          id: r.id, title: r.title, company: r.company, source: r.sourceLabel,
+          salary: r.salary, applied: r.applied, url: r.url,
+        })),
+      }, null, 2)
+    },
+  })
+}
+
+function atsApplySendTool(ctx) {
+  return defineTool({
+    name: "ats_apply_send",
+    description:
+      "为一 条「职位搜索」结果生成个性化打招呼语并登记代投:自动收录进岗位库、写入投递追踪(已投递),返回岗位链接与打招呼语文本(浏览器端会自动复制并打开岗位页)。payload 为 JSON 字符串:{id, greeting}。greeting 应结合用户简历(先 ats_status / ats_resume_read 了解背景)与该岗位亮点,80-150 字,口吻自然不浮夸;写完用一句话说明已代投并提醒用户去岗位页粘贴发送。",
+    parameters: {
+      payload: { type: "string", required: true, description: 'JSON 字符串:{id:"sxxxx", greeting:"打招呼语"}' },
+    },
+    output: TEXT_OUTPUT,
+    async execute(args, exec) {
+      const { cwd, session } = workspaceOf(exec)
+      const payload = payloadObject(args, "ats_apply_send")
+      const out = await applySearchItem(ctx, cwd, session, payload.id, payload.greeting, exec.signal)
+      if (out === undefined) return "没有找到这条搜索结果,请先用 ats_search_read 查看 id。"
+      return `已代投「${out.position}」@ ${out.company}:岗位链接与打招呼语已推送到浏览器(自动复制,粘贴发送即完成投递),投递追踪已同步(已投递)。打招呼语:${out.greeting}`
     },
   })
 }

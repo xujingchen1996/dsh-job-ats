@@ -2227,7 +2227,7 @@ function sessionPreset(row) {
 
     // ── plugin body ─────────────────────────────────────────────────────────
 
-    const inject = ["slots", "sessions"]
+    const inject = ["slots", "sessions", "uiSession"]
 
     function apply(ctx) {
       ctx.effect(() => {
@@ -2264,8 +2264,10 @@ function sessionPreset(row) {
 
       function sync() {
         const list = ctx.sessions.list.getSnapshot()
-        const row = list && list.current ? list.byId[list.current] : undefined
+        const sessionId = ctx.uiSession.adapter.current.getSnapshot().props?.sessionId
+        const row = sessionId === undefined ? undefined : list.byId[sessionId]
         const preset = sessionPreset(row)
+        // 主会话绑定切换或会话清单更新时，按该会话的预设显示对应工作台标签。
         const shouldShow = preset === "job-ats"
         if (shouldShow === showing) return
         showing = shouldShow
@@ -2274,9 +2276,11 @@ function sessionPreset(row) {
       }
 
       const unsubscribe = ctx.sessions.list.subscribe(sync)
+      const unsubscribeMain = ctx.uiSession.adapter.current.subscribe(sync)
       sync()
       ctx.effect(() => () => {
         unsubscribe()
+        unsubscribeMain()
         disposeAll()
       }, "dsh-job-ats: tab lifecycle")
     }

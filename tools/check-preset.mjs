@@ -3,7 +3,8 @@
  * 校验 dsh 预设的插件行能否解析 —— 防止「包名写错/臆造」导致会话无法打开。
  *
  * 会话 resume 失败最常见的根因：preset 的某一行 name 指向一个不存在的包
- * （例如把 dsh-workflow-worker-thread 写成不存在的 dsh-workflow-ptc）。
+ * （例如把 dsh-workflow-ptc 写成旧版包名 dsh-workflow-worker-thread —— 该包
+ *   在 0.2.0-rc.2 中已改名为 dsh-workflow-ptc，旧名无法解析）。
  *
  * 用法：
  *   node tools/check-preset.mjs                 # 自动探测本仓库 preset/ 与 dsh 安装位置

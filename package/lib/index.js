@@ -356,7 +356,23 @@ const SEARCH_SOURCES = {
   web: { label: "全网", query: (kw, city) => [kw, city, "招聘 岗位"].filter(Boolean).join(" ") },
 }
 const SEARCH_DEFAULT_SOURCES = ["boss", "shixiseng", "offershow", "web"]
-const SEARCH_MAX_RESULTS = 300
+const SEARCH_MAX_RESULTS = 600
+// 每次查询保留的条目上限。DeepSeek 搜索 provider 内部是带 web_search 工具的
+// LLM 调用(max_uses 次内部搜索后按 URL 去重),单次调用就可能返回几十条。
+const SEARCH_MAX_PER_QUERY = 30
+// 深度档位:每个来源发几个查询变体。变体 = 基础查询 + 后缀,用来扩大召回面
+// (同义词 / 时间性 / 内容形态)。来源之间并行、变体串行。
+const SEARCH_DEPTHS = {
+  fast: { label: "快", variants: 1 },
+  standard: { label: "标准", variants: 2 },
+  deep: { label: "深度", variants: 4 },
+}
+const SEARCH_QUERY_SUFFIXES = [
+  "",
+  " 2026 招聘信息",
+  " 薪资 待遇",
+  " 岗位要求 任职条件",
+]
 const CITY_POOL = [
   "北京", "上海", "广州", "深圳", "杭州", "成都", "南京", "武汉", "西安", "苏州",
   "天津", "长沙", "重庆", "合肥", "郑州", "厦门", "福州", "济南", "青岛", "大连",
@@ -381,6 +397,8 @@ async function sweepScheduledSearches(ctx) {
         keywords: cfg.keywords,
         city: cfg.city,
         sources: cfg.sources,
+        depth: cfg.depth,
+        fallbackDepth: "standard",
         by: "schedule",
       }, undefined)
     } catch {
@@ -430,10 +448,28 @@ function defaultSearchConfig() {
     keywords: "",
     city: "",
     sources: SEARCH_DEFAULT_SOURCES,
+    depth: "standard",
     scheduleEnabled: false,
     intervalMinutes: 30,
     lastRunAt: null,
     nextRunAt: null,
+  }
+}
+
+// 归一化用于去重与展示:去 fragment、去跟踪参数(utm_* / spm);不动业务参数
+// (如 zhipin 的 securityId/lid 是打开岗位页必需的)。
+function normalizeJobUrl(raw) {
+  try {
+    const u = new URL(String(raw))
+    u.hash = ""
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(utm_[a-z_]*|spm)$/i.test(key)) u.searchParams.delete(key)
+    }
+    let s = u.toString()
+    if (s.endsWith("?")) s = s.slice(0, -1)
+    return s
+  } catch {
+    return null
   }
 }
 
@@ -452,6 +488,9 @@ async function runSearchNow(ctx, cwd, session, opts, signal) {
   const requested = Array.isArray(opts.sources) && opts.sources.length > 0 ? opts.sources : SEARCH_DEFAULT_SOURCES
   const useSources = requested.filter((s) => SEARCH_SOURCES[s])
   const finalSources = useSources.length > 0 ? useSources : SEARCH_DEFAULT_SOURCES
+  // 深度档位决定每个来源发几个查询变体;定时任务用上次保存的档位
+  const depthKey = SEARCH_DEPTHS[opts.depth] ? opts.depth : (SEARCH_DEPTHS[opts.fallbackDepth] ? opts.fallbackDepth : "standard")
+  const variantCount = SEARCH_DEPTHS[depthKey].variants
 
   const data = await readSearchData(ctx, cwd, signal)
   const results = data.results
@@ -459,51 +498,70 @@ async function runSearchNow(ctx, cwd, session, opts, signal) {
 
   const fresh = []
   const perSource = {}
-  for (const sid of finalSources) {
+  const startedAt = Date.now()
+
+  // 每个来源内部串行跑自己的查询变体,来源之间并行 —— 墙钟时间 ≈ 最慢来源
+  async function runSource(sid) {
     const src = SEARCH_SOURCES[sid]
-    try {
-      const query = src.query(keywords, city)
-      const out = await ctx.web.search({ query, maxResults: 10 })
-      let added = 0
-      for (const s of out?.sources ?? []) {
-        if (!s.url || seenUrls.has(s.url)) continue
-        seenUrls.add(s.url)
-        const text = `${s.title || ""} ${s.snippet || ""}`
-        fresh.push({
-          id: searchResultId(s.url),
-          title: cleanText(s.title, 160) || "(无标题)",
-          company: guessCompany(s.title) || src.label,
-          url: s.url,
-          source: sid,
-          sourceLabel: src.label,
-          city: city || CITY_POOL.find((c) => text.includes(c)) || null,
-          salary: extractSalary(text),
-          snippet: cleanText(s.snippet, 300) || null,
-          publishedAt: typeof s.publishedAt === "string" ? s.publishedAt : null,
-          fetchedAt: new Date().toISOString(),
-          jd: null,
-          applied: false,
-        })
-        added++
+    let added = 0
+    const errors = []
+    for (const suffix of SEARCH_QUERY_SUFFIXES.slice(0, variantCount)) {
+      if (signal !== undefined && signal.aborted) break
+      try {
+        const query = src.query(keywords, city) + suffix
+        const out = await ctx.web.search({ query, maxResults: SEARCH_MAX_PER_QUERY })
+        for (const s of out?.sources ?? []) {
+          if (!s.url) continue
+          const url = normalizeJobUrl(s.url)
+          if (!url || seenUrls.has(url)) continue
+          seenUrls.add(url)
+          const text = `${s.title || ""} ${s.snippet || ""}`
+          fresh.push({
+            id: searchResultId(url),
+            title: cleanText(s.title, 160) || "(无标题)",
+            company: guessCompany(s.title) || src.label,
+            url,
+            source: sid,
+            sourceLabel: src.label,
+            city: city || CITY_POOL.find((c) => text.includes(c)) || null,
+            salary: extractSalary(text),
+            snippet: cleanText(s.snippet, 300) || null,
+            publishedAt: typeof s.publishedAt === "string" ? s.publishedAt : null,
+            fetchedAt: new Date().toISOString(),
+            jd: null,
+            applied: false,
+          })
+          added++
+        }
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error))
       }
-      perSource[sid] = { ok: true, added }
-    } catch (error) {
-      perSource[sid] = { ok: false, error: error instanceof Error ? error.message : String(error) }
     }
+    perSource[sid] = { ok: errors.length === 0, added, errors: errors.slice(0, 2) }
   }
+
+  await Promise.all(finalSources.map(runSource))
 
   const merged = [...fresh, ...results].slice(0, SEARCH_MAX_RESULTS)
   const cfg = data.config
   cfg.keywords = keywords
   cfg.city = city
   cfg.sources = finalSources
+  cfg.depth = depthKey
   cfg.lastRunAt = Date.now()
   if (opts.by === "schedule" && cfg.scheduleEnabled === true) {
     cfg.nextRunAt = Date.now() + Math.max(5, Number(cfg.intervalMinutes) || 30) * 60_000
   }
   await writeJson(ctx, cwd, SEARCH_FILE, { config: cfg, results: merged }, session, signal)
   scheduledSearchCwds.add(cwd)
-  return { added: fresh.length, total: merged.length, perSource }
+  return {
+    added: fresh.length,
+    total: merged.length,
+    perSource,
+    depth: depthKey,
+    queries: finalSources.length * variantCount,
+    elapsedMs: Date.now() - startedAt,
+  }
 }
 
 // 一键代投的共同实现(路由与模型工具共用):收录进岗位库 → 写投递追踪 →
@@ -651,6 +709,8 @@ async function handleApiRequest(ctx, req, res) {
       keywords: body?.keywords,
       city: body?.city,
       sources: body?.sources,
+      depth: body?.depth,
+      fallbackDepth: "standard",
       by: "manual",
     }, signal)
     sendJson(res, 200, { ok: true, ...out })
@@ -669,6 +729,7 @@ async function handleApiRequest(ctx, req, res) {
       const filtered = body.sources.filter((s) => SEARCH_SOURCES[s])
       if (filtered.length > 0) cfg.sources = filtered
     }
+    if (typeof body?.depth === "string" && SEARCH_DEPTHS[body.depth]) cfg.depth = body.depth
     cfg.nextRunAt = cfg.scheduleEnabled ? Date.now() + cfg.intervalMinutes * 60_000 : null
     await writeJson(ctx, cwd, SEARCH_FILE, data, session, signal)
     if (cfg.scheduleEnabled) scheduledSearchCwds.add(cwd)
@@ -2239,9 +2300,9 @@ function atsSearchRunTool(ctx) {
   return defineTool({
     name: "ats_search_run",
     description:
-      "执行一次职位聚合搜索(Boss直聘 / 实习僧 / OfferShow / 全网;经搜索引擎 site: 限定聚合公开岗位索引),结果写入「职位搜索」标签页并持久化到 .ats/search.json。payload 为 JSON 字符串:{keywords:\"Java 后端\", city?:\"上海\", sources?:[\"boss\",\"shixiseng\",\"offershow\",\"web\"]}。用户想找岗位、看机会、比选项时使用;搜完提醒用户去「职位搜索」标签页浏览,可对心仪岗位用 ats_apply_send 代投。",
+      "执行一次职位聚合搜索(Boss直聘 / 实习僧 / OfferShow / 全网;经搜索引擎 site: 限定聚合公开岗位索引),结果写入「职位搜索」标签页并持久化到 .ats/search.json。payload 为 JSON 字符串:{keywords:\"Java 后端\", city?:\"上海\", sources?:[\"boss\",\"shixiseng\",\"offershow\",\"web\"], depth?:\"fast\"|\"standard\"|\"deep\"}。depth 控制每个来源的查询变体数(fast=1/standard=2/deep=4),deep 召回最多但最慢(约 1-2 分钟)。用户想找岗位、看机会、比选项时使用;搜完提醒用户去「职位搜索」标签页浏览,可对心仪岗位用 ats_apply_send 代投。",
     parameters: {
-      payload: { type: "string", required: true, description: 'JSON 字符串:{keywords:"关键词", city:"城市(可省)", sources?:["boss","web"]}' },
+      payload: { type: "string", required: true, description: 'JSON 字符串:{keywords:"关键词", city:"城市(可省)", sources?:["boss","web"], depth?:"fast"|"standard"|"deep"}' },
     },
     output: TEXT_OUTPUT,
     async execute(args, exec) {
@@ -2251,10 +2312,12 @@ function atsSearchRunTool(ctx) {
         keywords: payload.keywords,
         city: payload.city,
         sources: payload.sources,
+        depth: payload.depth,
+        fallbackDepth: "standard",
         by: "manual",
       }, exec.signal)
-      const failed = Object.entries(out.perSource).filter(([, v]) => v.ok === false).map(([k, v]) => `${k}:${v.error}`)
-      return `搜索完成:新增 ${out.added} 条(总计 ${out.total} 条),用户可在「职位搜索」标签页查看。` +
+      const failed = Object.entries(out.perSource).filter(([, v]) => v.ok === false).map(([k, v]) => `${k}:${(v.errors ?? [v.error])[0] ?? ""}`)
+      return `搜索完成(${out.depth} 档,${out.queries} 个查询,耗时 ${Math.round(out.elapsedMs / 1000)}s):新增 ${out.added} 条(总计 ${out.total} 条),用户可在「职位搜索」标签页查看。` +
         (out.added === 0 ? "没有新结果,建议换关键词或扩展来源重试。" : "心仪的岗位可以用 ats_apply_send 生成个性化打招呼语并一键代投。") +
         (failed.length > 0 ? `\n部分来源失败:${failed.join(";")}` : "")
     },

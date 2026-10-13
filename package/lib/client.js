@@ -114,12 +114,12 @@ function sessionPreset(row) {
       return await res.json()
     }
 
-    async function apiPost(sessionId, path, body) {
+    async function apiPost(sessionId, path, body, ms) {
       const res = await fetchWithTimeout("/ats-api" + path + (path.includes("?") ? "&" : "?") + "sessionId=" + encodeURIComponent(sessionId), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-      })
+      }, ms)
       return await res.json()
     }
 
@@ -2010,6 +2010,15 @@ function sessionPreset(row) {
       { id: "web", label: "全网" },
     ]
 
+    // 深度档位:每个来源的查询变体数(与 host 侧 SEARCH_DEPTHS 对应)。
+    // 聚合搜索 = 多个查询变体,慢档召回显著更多;前端超时按档位放宽。
+    const SEARCH_DEPTHS_UI = [
+      { id: "fast", label: "快", hint: "1 变体/源 · 约 15s · 数十条" },
+      { id: "standard", label: "标准", hint: "2 变体/源 · 约 40s · 上百条" },
+      { id: "deep", label: "深度", hint: "4 变体/源 · 约 1-2 分钟 · 数百条" },
+    ]
+    const SEARCH_TIMEOUT_MS = { fast: 30_000, standard: 75_000, deep: 180_000 }
+
     function fmtClock(ts) {
       if (!ts) return "—"
       const d = new Date(ts)
@@ -2043,6 +2052,7 @@ function sessionPreset(row) {
       const [keywords, setKeywords] = React.useState("")
       const [city, setCity] = React.useState("")
       const [sources, setSources] = React.useState(SEARCH_SOURCES_UI.map((s) => s.id))
+      const [depth, setDepth] = React.useState("standard")
       const [formSeeded, setFormSeeded] = React.useState(false)
       const [showSchedule, setShowSchedule] = React.useState(false)
       const [intervalMinutes, setIntervalMinutes] = React.useState(30)
@@ -2056,6 +2066,7 @@ function sessionPreset(row) {
           if (cfg.keywords) setKeywords(cfg.keywords)
           if (cfg.city) setCity(cfg.city)
           if (Array.isArray(cfg.sources) && cfg.sources.length > 0) setSources(cfg.sources)
+          if (cfg.depth && SEARCH_DEPTHS_UI.some((d) => d.id === cfg.depth)) setDepth(cfg.depth)
           if (cfg.intervalMinutes) setIntervalMinutes(cfg.intervalMinutes)
         }
       }, [search.data, formSeeded])
@@ -2067,9 +2078,12 @@ function sessionPreset(row) {
         if (!keywords.trim()) { flash("先填写搜索关键词(岗位 / 技能)", "error"); return }
         setRunning(true)
         try {
-          const json = await apiPost(sessionId, "/search/run", { keywords, city, sources })
+          const depthHint = SEARCH_DEPTHS_UI.find((d) => d.id === depth)
+          flash(`开始${depthHint ? depthHint.label : ""}搜索(${depthHint ? depthHint.hint : ""}),完成后列表自动刷新…`)
+          const json = await apiPost(sessionId, "/search/run", { keywords, city, sources, depth }, SEARCH_TIMEOUT_MS[depth] || 75_000)
           if (json && json.ok) {
-            flash(`搜索完成:新增 ${json.added} 条(共 ${json.total} 条)`)
+            const failed = Object.entries(json.perSource || {}).filter(([, v]) => v.ok === false).map(([k]) => k)
+            flash(`搜索完成:${json.depth === "deep" ? "深度" : json.depth === "standard" ? "标准" : "快"}档 · ${json.queries} 个查询 · 耗时 ${Math.round((json.elapsedMs || 0) / 1000)}s,新增 ${json.added} 条(共 ${json.total} 条)` + (failed.length ? ` · 失败来源:${failed.join("/")}` : ""))
             await search.refresh()
           } else flash((json && json.error) || "搜索失败", "error")
         } catch (err) {
@@ -2133,8 +2147,8 @@ function sessionPreset(row) {
         actions: [
           h("button", { key: "sched", className: "ats-btn" + (scheduleOn ? " ats-btn-primary" : ""), onClick: () => setShowSchedule((v) => !v) },
             scheduleOn ? `⏱ 定时中·每 ${cfg.intervalMinutes} 分钟` : "⏱ 定时刷新"),
-          h("button", { key: "run", className: "ats-btn ats-btn-primary", disabled: running, onClick: runSearch },
-            running ? "搜索中…" : "🔍 搜索"),
+          h("button", { key: "run", className: "ats-btn ats-btn-primary", disabled: running, onClick: runSearch, title: (SEARCH_DEPTHS_UI.find((d) => d.id === depth) || {}).hint || "" },
+            running ? `搜索中(${(SEARCH_DEPTHS_UI.find((d) => d.id === depth) || {}).label || ""})…` : `🔍 搜索·${(SEARCH_DEPTHS_UI.find((d) => d.id === depth) || {}).label || ""}`),
         ],
       },
         h("div", { className: "ats-search-formrow" },
@@ -2148,6 +2162,15 @@ function sessionPreset(row) {
               className: "ats-chip" + (sources.includes(s.id) ? " ats-chip-active" : ""),
               onClick: () => toggleSource(s.id),
             }, s.label),
+          ),
+          h("span", { className: "ats-dim", style: { margin: "0 2px" } }, "│"),
+          SEARCH_DEPTHS_UI.map((d) =>
+            h("button", {
+              key: d.id,
+              title: d.hint,
+              className: "ats-chip" + (depth === d.id ? " ats-chip-active" : ""),
+              onClick: () => setDepth(d.id),
+            }, d.label),
           ),
         ),
         showSchedule && h("div", { className: "ats-export-bar", style: { marginTop: 12 } },

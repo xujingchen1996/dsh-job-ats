@@ -373,6 +373,12 @@ const SEARCH_QUERY_SUFFIXES = [
   " 薪资 待遇",
   " 岗位要求 任职条件",
 ]
+// 自动代抓 JD:搜索完成后按排名给头部结果抓详情,「搜到就有」;其余结果在
+// 用户点开时由浏览器自动触发补抓。已知登录墙站点(Boss直聘对未登录返回
+// 验证页)直接标记跳过 —— 服务器没有用户登录态,代抓必然失败,不浪费请求。
+const SEARCH_JD_AUTO_LIMIT = { fast: 6, standard: 12, deep: 18 }
+const SEARCH_JD_CONCURRENCY = 5
+const SEARCH_JD_SKIP_HOST = /(^|\.)zhipin\.com$/i
 const CITY_POOL = [
   "北京", "上海", "广州", "深圳", "杭州", "成都", "南京", "武汉", "西安", "苏州",
   "天津", "长沙", "重庆", "合肥", "郑州", "厦门", "福州", "济南", "青岛", "大连",
@@ -473,6 +479,59 @@ function normalizeJobUrl(raw) {
   }
 }
 
+function isJdSkipHost(url) {
+  try {
+    return SEARCH_JD_SKIP_HOST.test(new URL(String(url)).hostname)
+  } catch {
+    return false
+  }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const queue = [...items]
+  const runners = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift()
+      try {
+        await worker(item)
+      } catch {
+        // worker 内部已兜底;这里只为不让单个失败打断整批
+      }
+    }
+  })
+  await Promise.all(runners)
+}
+
+// 批量代抓 JD:成功写 item.jd;失败写 item.jdUnavailable(原因),客户端据此
+// 显示诚实提示而不是无限重试。返回 {fetched, skipped, failed}。
+async function autoFetchJds(ctx, cwd, session, results, limit, signal) {
+  const pending = results.filter((r) => !r.jd && !r.jdUnavailable).slice(0, limit)
+  let fetched = 0
+  let skipped = 0
+  let failed = 0
+  await mapWithConcurrency(pending, SEARCH_JD_CONCURRENCY, async (item) => {
+    if (signal !== undefined && signal.aborted) return
+    if (isJdSkipHost(item.url)) {
+      item.jdUnavailable = "该站点(Boss直聘)详情页需要登录,服务器无法代抓"
+      skipped++
+      return
+    }
+    try {
+      const out = await ctx.web.fetch({ url: item.url }, signal)
+      if (out.statusCode >= 400) throw new Error(`页面返回 ${out.statusCode}`)
+      const content = out.body && typeof out.body.content === "string" ? out.body.content : ""
+      const text = stripHtml(content).slice(0, 20000)
+      if (text.length < 80) throw new Error("页面内容过短,可能需要登录后才能看到 JD")
+      item.jd = text
+      fetched++
+    } catch (error) {
+      item.jdUnavailable = error instanceof Error ? error.message : String(error)
+      failed++
+    }
+  })
+  return { fetched, skipped, failed }
+}
+
 async function readSearchData(ctx, cwd, signal) {
   const data = await readJson(ctx, cwd, SEARCH_FILE, signal)
   return {
@@ -552,6 +611,8 @@ async function runSearchNow(ctx, cwd, session, opts, signal) {
   if (opts.by === "schedule" && cfg.scheduleEnabled === true) {
     cfg.nextRunAt = Date.now() + Math.max(5, Number(cfg.intervalMinutes) || 30) * 60_000
   }
+  // 「搜到就有」:合并后新结果排前,自动代抓头部结果的 JD(登录墙站点标记跳过)
+  const jdStats = await autoFetchJds(ctx, cwd, session, merged, SEARCH_JD_AUTO_LIMIT[depthKey] ?? 12, signal)
   await writeJson(ctx, cwd, SEARCH_FILE, { config: cfg, results: merged }, session, signal)
   scheduledSearchCwds.add(cwd)
   return {
@@ -561,6 +622,7 @@ async function runSearchNow(ctx, cwd, session, opts, signal) {
     depth: depthKey,
     queries: finalSources.length * variantCount,
     elapsedMs: Date.now() - startedAt,
+    jdAuto: jdStats,
   }
 }
 

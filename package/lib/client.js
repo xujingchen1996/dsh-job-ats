@@ -2074,6 +2074,15 @@ function sessionPreset(row) {
       const selected = results.find((r) => r.id === selectedId) || null
       const scheduleOn = cfg.scheduleEnabled === true
 
+      // 点开即自动抓取 JD:host 搜索时已代抓头部结果(selected.jd 直接有),
+      // 其余在这里补抓;登录墙站点(host 标记 jdUnavailable)不重复请求。
+      React.useEffect(() => {
+        if (selected && !selected.jd && !selected.jdUnavailable && jd === null) {
+          loadJd(selected)
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [selectedId])
+
       async function runSearch() {
         if (!keywords.trim()) { flash("先填写搜索关键词(岗位 / 技能)", "error"); return }
         setRunning(true)
@@ -2083,7 +2092,8 @@ function sessionPreset(row) {
           const json = await apiPost(sessionId, "/search/run", { keywords, city, sources, depth }, SEARCH_TIMEOUT_MS[depth] || 75_000)
           if (json && json.ok) {
             const failed = Object.entries(json.perSource || {}).filter(([, v]) => v.ok === false).map(([k]) => k)
-            flash(`搜索完成:${json.depth === "deep" ? "深度" : json.depth === "standard" ? "标准" : "快"}档 · ${json.queries} 个查询 · 耗时 ${Math.round((json.elapsedMs || 0) / 1000)}s,新增 ${json.added} 条(共 ${json.total} 条)` + (failed.length ? ` · 失败来源:${failed.join("/")}` : ""))
+            const jdInfo = json.jdAuto ? ` · 已自动抓取 ${json.jdAuto.fetched} 条 JD` : ""
+            flash(`搜索完成:${json.depth === "deep" ? "深度" : json.depth === "standard" ? "标准" : "快"}档 · ${json.queries} 个查询 · 耗时 ${Math.round((json.elapsedMs || 0) / 1000)}s,新增 ${json.added} 条(共 ${json.total} 条)${jdInfo}` + (failed.length ? ` · 失败来源:${failed.join("/")}` : ""))
             await search.refresh()
           } else flash((json && json.error) || "搜索失败", "error")
         } catch (err) {
@@ -2230,19 +2240,22 @@ function sessionPreset(row) {
                   h("div", { className: "ats-card-actions", style: { marginTop: 10 } },
                     h("button", { className: "ats-btn ats-btn-primary", onClick: () => applyOne(selected) }, "🚀 一键代投"),
                     h("button", { className: "ats-btn", onClick: () => collectOne(selected) }, "📥 收录到岗位库"),
-                    h("button", { className: "ats-btn", onClick: () => loadJd(selected) }, jd && jd.text ? "🔄 重新抓取 JD" : "📄 抓取 JD"),
+                    h("button", { className: "ats-btn", onClick: () => loadJd(selected) }, ((jd && jd.text) || selected.jd) ? "🔄 重新抓取 JD" : "📄 抓取 JD"),
                     h("button", { className: "ats-btn", onClick: () => { navigator.clipboard.writeText(selected.url).then(() => flash("链接已复制")) } }, "复制链接"),
                     h("a", { className: "ats-btn", href: selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗"),
                   ),
                   h("div", { className: "ats-search-jd" },
-                    jd === null
-                      ? "点「抓取 JD」读取岗位描述;站点需要登录时抓取会失败,可直接打开原页查看。"
-                      : jd.loading
-                        ? "抓取中…"
-                        : jd.text
-                          ? jd.text
-                          : h("span", null, h("span", { className: "ats-status-error" }, jd.error || "抓取失败"), " ",
-                              h("a", { href: jd.url || selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗")),
+                    ((jd && jd.text) || selected.jd)
+                      ? ((jd && jd.text) || selected.jd)
+                      : jd && jd.loading
+                        ? "正在自动抓取 JD…"
+                        : jd && jd.error
+                          ? h("span", null, h("span", { className: "ats-status-error" }, jd.error), " ",
+                              h("a", { href: jd.url || selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗"))
+                          : selected.jdUnavailable
+                            ? h("span", null, h("span", { className: "ats-status-error" }, selected.jdUnavailable), " ",
+                                h("a", { href: selected.url, target: "_blank", rel: "noopener" }, "打开原页 ↗"))
+                            : "正在自动抓取 JD…",
                   ),
                 ),
           ),
